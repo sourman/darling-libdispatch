@@ -23,6 +23,8 @@
 #if HAVE_MACH
 #include "protocol.h"
 #include "protocolServer.h"
+#include <poll.h>
+#include <pthread.h>
 #endif
 
 #if DISPATCH_USE_KEVENT_WORKQUEUE && !DISPATCH_USE_KEVENT_QOS
@@ -1117,6 +1119,10 @@ _dispatch_mach_muxnote_find(mach_port_t name, int16_t filter)
 }
 #endif
 
+#if HAVE_MACH
+static void _dispatch_machport_poll_arm(dispatch_unote_t du);
+#endif
+
 bool
 _dispatch_unote_register_muxed(dispatch_unote_t du)
 {
@@ -1172,6 +1178,15 @@ _dispatch_unote_register_muxed(dispatch_unote_t du)
 		_dispatch_unote_state_set(du, DISPATCH_WLH_ANON, DU_STATE_ARMED);
 		_dispatch_du_debug("installed", du._du);
 	}
+#if HAVE_MACH
+	if (du._du->du_filter == EVFILT_MACHPORT) {
+		if (!installed) {
+			_dispatch_unote_state_set(du, DISPATCH_WLH_ANON, DU_STATE_ARMED);
+		}
+		_dispatch_machport_poll_arm(du);
+		return true;
+	}
+#endif
 	return installed;
 }
 
@@ -1236,10 +1251,116 @@ _dispatch_unote_unregister_muxed(dispatch_unote_t du)
 	return true;
 }
 
+#if HAVE_MACH
+struct _dispatch_machport_poll_s {
+	dispatch_unote_t du;
+	mach_port_t port;
+	unsigned fires;
+	unsigned inflight;
+};
+
+/*
+ * kqchan/kevent_qos ADD on the check-in port leaves it live but unserved.
+ * Skip that attach (register_direct). Poll the receive mqueue and merge
+ * only when dtape actually has a kmsg. Fake-firing EVFILT_MACHPORT /
+ * MACH_RECV on an empty port every 50ms SIGSEGVs dispatch_mig_server
+ * and Chromium HandleRequest (iokitd death port, GPU/network helpers).
+ */
+static void *
+_dispatch_machport_poll_thread(void *arg)
+{
+	struct _dispatch_machport_poll_s *p = arg;
+	dispatch_queue_global_t gq = dispatch_get_global_queue(
+			DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+
+	fprintf(stderr, "dispatch MACHPORT poll running port=0x%x\n", p->port);
+	fflush(stderr);
+	for (;;) {
+		mach_port_status_t status = { .mps_pset = 0 };
+		mach_msg_type_number_t cnt = MACH_PORT_RECEIVE_STATUS_COUNT;
+		kern_return_t kr;
+		struct pollfd pfd = { .fd = -1, .events = 0 };
+		(void)poll(&pfd, 0, 50);
+		if (!_dispatch_unote_registered(p->du)) {
+			fprintf(stderr, "dispatch MACHPORT poll exit port=0x%x\n", p->port);
+			fflush(stderr);
+			return NULL;
+		}
+		kr = mach_port_get_attributes(mach_task_self(), p->port,
+				MACH_PORT_RECEIVE_STATUS, (mach_port_info_t)&status, &cnt);
+		if (kr != KERN_SUCCESS || status.mps_msgcount == 0) {
+			continue;
+		}
+		if (!os_atomic_cmpxchg(&p->inflight, 0, 1, relaxed)) {
+			continue;
+		}
+		unsigned msgcount = status.mps_msgcount;
+		dispatch_async((dispatch_queue_t)gq, ^{
+			unsigned n;
+			_dispatch_retain_unote_owner(p->du);
+			os_atomic_store2o(p->du._dr, ds_pending_data,
+					DISPATCH_MACH_RECV_MESSAGE, relaxed);
+			_dispatch_kevent_merge_ev_flags(p->du,
+					EV_UDATA_SPECIFIC | EV_DISPATCH);
+			_dispatch_source_merge_evt(p->du, EV_UDATA_SPECIFIC | EV_DISPATCH,
+					DISPATCH_MACH_RECV_MESSAGE, 0);
+			n = ++p->fires;
+			os_atomic_store(&p->inflight, 0, relaxed);
+			if (n <= 8 || (n % 20) == 1) {
+				fprintf(stderr,
+						"dispatch MACHPORT poll fire port=0x%x n=%u msgcount=%u\n",
+						p->port, n, msgcount);
+				fflush(stderr);
+			}
+		});
+	}
+}
+
+static void
+_dispatch_machport_poll_arm(dispatch_unote_t du)
+{
+	struct _dispatch_machport_poll_s *p = malloc(sizeof(*p));
+	pthread_t th;
+
+	if (!p) {
+		return;
+	}
+	p->du = du;
+	p->port = (mach_port_t)du._du->du_ident;
+	p->fires = 0;
+	p->inflight = 0;
+	fprintf(stderr, "dispatch MACHPORT poll arm port=0x%x ident=%llu filter=%d\n",
+			p->port, (unsigned long long)du._du->du_ident, (int)du._du->du_filter);
+	fflush(stderr);
+	if (pthread_create(&th, NULL, _dispatch_machport_poll_thread, p) != 0) {
+		fprintf(stderr, "dispatch MACHPORT poll pthread_create failed port=0x%x\n",
+				p->port);
+		fflush(stderr);
+		free(p);
+		return;
+	}
+	pthread_detach(th);
+}
+#endif
+
 #if DISPATCH_HAVE_DIRECT_KNOTES
 bool
 _dispatch_unote_register_direct(dispatch_unote_t du, dispatch_wlh_t wlh)
 {
+#if HAVE_MACH
+	/* Skip kevent ADD for MACH_RECV. kqchan attach on the check-in port
+	 * leaves an empty live name: GPU send completes, Chrome mach_msg
+	 * times out. Poller wakes HandleRequest; mach_msg reads the mqueue. */
+	if (du._du->du_filter == EVFILT_MACHPORT) {
+		_dispatch_wlh_retain(wlh);
+		_dispatch_unote_state_set(du, wlh, DU_STATE_ARMED);
+		fprintf(stderr, "dispatch MACHPORT register_direct skip-kevent port=0x%x\n",
+				(mach_port_t)du._du->du_ident);
+		fflush(stderr);
+		_dispatch_machport_poll_arm(du);
+		return true;
+	}
+#endif
 	return _dispatch_kq_unote_update(wlh, du, EV_ADD | EV_ENABLE);
 }
 
@@ -1247,12 +1368,28 @@ void
 _dispatch_unote_resume_direct(dispatch_unote_t du)
 {
 	_dispatch_unote_state_set_bit(du, DU_STATE_ARMED);
+#if HAVE_MACH
+	if (du._du->du_filter == EVFILT_MACHPORT) {
+		return;
+	}
+#endif
 	_dispatch_kq_unote_update(_dispatch_unote_wlh(du), du, EV_ENABLE);
 }
 
 bool
 _dispatch_unote_unregister_direct(dispatch_unote_t du, uint32_t flags)
 {
+#if HAVE_MACH
+	if (du._du->du_filter == EVFILT_MACHPORT) {
+		dispatch_unote_state_t st = _dispatch_unote_state(du);
+		dispatch_wlh_t wlh = _du_state_wlh(st);
+		if (_du_state_registered(st)) {
+			_dispatch_wlh_release(wlh);
+		}
+		_dispatch_unote_state_set(du, DU_STATE_UNREGISTERED);
+		return true;
+	}
+#endif
 	dispatch_unote_state_t du_state = _dispatch_unote_state(du);
 	dispatch_wlh_t du_wlh = _du_state_wlh(du_state);
 	dispatch_deferred_items_t ddi = _dispatch_deferred_items_get();
