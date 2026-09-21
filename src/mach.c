@@ -19,6 +19,7 @@
  */
 
 #include "internal.h"
+#include <stdio.h>
 #if HAVE_MACH
 
 #define DISPATCH_MACH_RETURN_IMMEDIATE_SEND_RESULT 0x1
@@ -789,7 +790,7 @@ _dispatch_mach_msg_reply_recv(dispatch_mach_t dm,
 	mach_msg_header_t *hdr, *hdr2 = NULL;
 	void *hdr_copyout_addr;
 	mach_msg_size_t siz, msgsiz = 0;
-	mach_msg_return_t kr;
+	mach_msg_return_t kr = MACH_MSG_SUCCESS;
 	mach_msg_option_t options;
 	mach_port_t notify = MACH_PORT_NULL;
 	siz = mach_vm_round_page(DISPATCH_MACH_RECEIVE_MAX_INLINE_MESSAGE_SIZE +
@@ -797,25 +798,47 @@ _dispatch_mach_msg_reply_recv(dispatch_mach_t dm,
 	hdr = alloca(siz);
 	_dispatch_mach_stack_probe(hdr, siz);
 	options = DISPATCH_MACH_RCV_OPTIONS & (~MACH_RCV_VOUCHER);
-	if (MACH_PORT_VALID(send)) {
-		notify = send;
-		options |= MACH_RCV_SYNC_WAIT;
-	}
+	/*
+	 * Darling: do not MACH_RCV_SYNC_WAIT. Linking ith_special_reply_port
+	 * returns MACH_RCV_INVALID_NOTIFY when the reply port is not the
+	 * thread special port, and waitq deadline=0 is treated as already
+	 * expired (MACH_RCV_TIMED_OUT). That used to DISPATCH_INTERNAL_CRASH
+	 * in this function (ud2 at file+0x29656). rax=-6 was
+	 * kr-MACH_RCV_PORT_DIED, i.e. kr=MACH_RCV_TIMED_OUT (0x10004003),
+	 * not KERN_RESOURCE_SHORTAGE and not MACH_SEND_INVALID_DEST.
+	 */
+	(void)send;
+	notify = MACH_PORT_NULL;
 	if (dm->dm_strict_reply) {
 		options |= MACH_MSG_STRICT_REPLY;
 	}
+	options |= MACH_RCV_TIMEOUT;
+	mach_msg_timeout_t rcv_timeout = 60 * 1000;
+	unsigned recv_tries = 0;
 
 retry:
+	if (++recv_tries > 8) {
+		fprintf(stderr,
+			"dispatch reply_recv give-up port=0x%x kr=0x%x tries=%u\n",
+			reply_port, kr, recv_tries);
+		fflush(stderr);
+		goto port_gone;
+	}
 	_dispatch_debug_machport(reply_port);
 	_dispatch_debug("machport[0x%08x]: MACH_RCV_MSG %s", reply_port,
 			(options & MACH_RCV_TIMEOUT) ? "poll" : "wait");
-	kr = mach_msg(hdr, options, 0, siz, reply_port, MACH_MSG_TIMEOUT_NONE,
-			notify);
+	kr = mach_msg(hdr, options, 0, siz, reply_port, rcv_timeout, notify);
 	hdr_copyout_addr = hdr;
 	_dispatch_debug_machport(reply_port);
 	_dispatch_debug("machport[0x%08x]: MACH_RCV_MSG (size %u, opts 0x%x) "
 			"returned: %s - 0x%x", reply_port, siz, options,
 			mach_error_string(kr), kr);
+	if (kr) {
+		fprintf(stderr,
+			"dispatch reply_recv kr=0x%x port=0x%x timeout=%u opts=0x%x try=%u\n",
+			kr, reply_port, rcv_timeout, options, recv_tries);
+		fflush(stderr);
+	}
 	switch (kr) {
 	case MACH_RCV_TOO_LARGE:
 		if (unlikely(hdr->msgh_size > UINT_MAX - DISPATCH_MACH_TRAILER_SIZE)) {
@@ -828,8 +851,8 @@ retry:
 				hdr = hdr2;
 				siz = msgsiz;
 			}
-			options |= MACH_RCV_TIMEOUT;
 			options &= ~MACH_RCV_LARGE;
+			rcv_timeout = 0;
 			goto retry;
 		}
 		_dispatch_log("BUG in libdispatch client: "
@@ -837,9 +860,21 @@ retry:
 				"large to fit in memory: id = 0x%x, size = %u", hdr->msgh_id,
 				hdr->msgh_size);
 		break;
+	case MACH_RCV_TIMED_OUT:
+		if (rcv_timeout == 0) {
+			rcv_timeout = 60 * 1000;
+			goto retry;
+		}
+		goto port_gone;
+	case MACH_RCV_INVALID_NOTIFY:
+	case MACH_RCV_INTERRUPTED:
+		rcv_timeout = 60 * 1000;
+		goto retry;
 	case MACH_RCV_INVALID_NAME: // rdar://problem/21963848
 	case MACH_RCV_PORT_CHANGED: // rdar://problem/21885327
 	case MACH_RCV_PORT_DIED:
+	case KERN_RESOURCE_SHORTAGE:
+port_gone:
 		// channel was disconnected/canceled and reply port destroyed
 		_dispatch_debug("machport[0x%08x]: sync reply port destroyed, ctxt %p: "
 				"%s - 0x%x", reply_port, ctxt, mach_error_string(kr), kr);
@@ -861,10 +896,12 @@ retry:
 			if (shrink) hdr = hdr2 = shrink;
 		}
 		break;
-	case MACH_RCV_INVALID_NOTIFY:
 	default:
-		DISPATCH_INTERNAL_CRASH(kr, "Unexpected error from mach_msg_receive");
-		break;
+		fprintf(stderr,
+			"dispatch reply_recv unexpected kr=0x%x (%d) port=0x%x\n",
+			kr, (int)kr, reply_port);
+		fflush(stderr);
+		goto port_gone;
 	}
 	_dispatch_mach_msg_reply_received(dm, dwr, hdr->msgh_local_port);
 	hdr->msgh_local_port = MACH_PORT_NULL;

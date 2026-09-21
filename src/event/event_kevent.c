@@ -25,6 +25,11 @@
 #include "protocolServer.h"
 #include <poll.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <stdlib.h>
+#include <string.h>
 #endif
 
 #if DISPATCH_USE_KEVENT_WORKQUEUE && !DISPATCH_USE_KEVENT_QOS
@@ -1257,6 +1262,7 @@ struct _dispatch_machport_poll_s {
 	mach_port_t port;
 	unsigned fires;
 	unsigned inflight;
+	unsigned held;
 };
 
 /*
@@ -1265,7 +1271,262 @@ struct _dispatch_machport_poll_s {
  * only when dtape actually has a kmsg. Fake-firing EVFILT_MACHPORT /
  * MACH_RECV on an empty port every 50ms SIGSEGVs dispatch_mig_server
  * and Chromium HandleRequest (iokitd death port, GPU/network helpers).
+ *
+ * Invitation-before-MOVE (v2): Chromium LaunchProcess stashes the Mojo
+ * receive right in MachPortRendezvous, posix_spawnp, then
+ * OutgoingInvitation::Send (often on a busy UI thread). The child look_ups
+ * the server and HandleRequest MOVEs that receive right. Cross-task send
+ * after MOVE never lands in the child's mqueue (child 'mojo' poller never
+ * fires; GPU/renderer win because they rendezvous after Send). Hold the
+ * first kmsgs so Send can queue the invitation, then drain one-at-a-time.
  */
+static int
+_dispatch_machport_holdoff_ok(void)
+{
+	/*
+	 * Do not delay GPU channel. Waiting for mps_msgcount to sit still
+	 * never finished once the first GPU stayed alive, so the browser
+	 * never reached NativeWidget / network spawn.
+	 */
+	return 0;
+}
+
+static int
+_dispatch_cmdline_is_gpu(void)
+{
+	static int cached = -1;
+	char buf[4096];
+	FILE *fp;
+	size_t n;
+	size_t i;
+
+	if (cached >= 0) {
+		return cached;
+	}
+	fp = fopen("/proc/self/cmdline", "r");
+	if (!fp) {
+		cached = 0;
+		return 0;
+	}
+	n = fread(buf, 1, sizeof(buf) - 1, fp);
+	fclose(fp);
+	if (n == 0) {
+		cached = 0;
+		return 0;
+	}
+	buf[n] = '\0';
+	for (i = 0; i < n; ) {
+		if (strcmp(buf + i, "--type=gpu-process") == 0) {
+			cached = 1;
+			return 1;
+		}
+		i += strlen(buf + i) + 1;
+	}
+	cached = 0;
+	return 0;
+}
+
+__attribute__((used)) static const char dispatch_nested_timeout0_v1[] =
+	"channelmac_nested_timeout0_v1";
+
+static int
+_dispatch_cmdline_is_network(void)
+{
+	static int cached = -1;
+	char buf[4096];
+	FILE *fp;
+	size_t n;
+	size_t i;
+
+	if (cached >= 0) {
+		return cached;
+	}
+	fp = fopen("/proc/self/cmdline", "r");
+	if (!fp) {
+		cached = 0;
+		return 0;
+	}
+	n = fread(buf, 1, sizeof(buf) - 1, fp);
+	fclose(fp);
+	if (n == 0) {
+		cached = 0;
+		return 0;
+	}
+	buf[n] = '\0';
+	for (i = 0; i < n; ) {
+		if (strstr(buf + i, "network.mojom.NetworkService") != NULL) {
+			cached = 1;
+			return 1;
+		}
+		i += strlen(buf + i) + 1;
+	}
+	cached = 0;
+	return 0;
+}
+
+/*
+ * Do not gate drain_hot on a PA cage (cages=0 forever, code204
+ * sitting=1 timeout). Enable once CrGpuMain exists so Channel
+ * attach is ~2s. Network Ping still waits in kqchan until
+ * gpu-alive-10s. Skip cage-hold.
+ */
+__attribute__((used)) static const char drain_hot_gpu_connected_v1[] =
+	"drain_hot_gpu_connected_v1";
+
+static int
+_dispatch_self_has_comm(const char *want)
+{
+	DIR *d;
+	struct dirent *de;
+	char path[64];
+	char name[32];
+	FILE *fp;
+	size_t wlen;
+
+	if (want == NULL || want[0] == '\0') {
+		return 0;
+	}
+	wlen = strlen(want);
+	d = opendir("/proc/self/task");
+	if (!d) {
+		return 0;
+	}
+	while ((de = readdir(d)) != NULL) {
+		char *nl;
+
+		if (de->d_name[0] == '.') {
+			continue;
+		}
+		snprintf(path, sizeof(path), "/proc/self/task/%s/comm",
+				de->d_name);
+		fp = fopen(path, "r");
+		if (!fp) {
+			continue;
+		}
+		if (fgets(name, sizeof(name), fp) == NULL) {
+			fclose(fp);
+			continue;
+		}
+		fclose(fp);
+		nl = strchr(name, '\n');
+		if (nl) {
+			*nl = '\0';
+		}
+		if (strncmp(name, want, wlen) == 0) {
+			closedir(d);
+			return 1;
+		}
+	}
+	closedir(d);
+	return 0;
+}
+
+static int
+_dispatch_gpu_age_sec(void)
+{
+	static unsigned long long startticks;
+	static int inited;
+	char buf[4096];
+	FILE *fp;
+	char *p;
+	int i;
+	size_t n;
+	double uptime = 0;
+	long hz = 100;
+
+	if (!inited) {
+		fp = fopen("/proc/self/stat", "r");
+		if (!fp) {
+			return 0;
+		}
+		n = fread(buf, 1, sizeof(buf) - 1, fp);
+		fclose(fp);
+		if (n == 0) {
+			return 0;
+		}
+		buf[n] = '\0';
+		p = strrchr(buf, ')');
+		if (!p) {
+			return 0;
+		}
+		p++;
+		for (i = 0; i < 19; i++) {
+			while (*p == ' ') {
+				p++;
+			}
+			while (*p && *p != ' ') {
+				p++;
+			}
+		}
+		while (*p == ' ') {
+			p++;
+		}
+		startticks = strtoull(p, NULL, 10);
+		inited = 1;
+	}
+	fp = fopen("/proc/uptime", "r");
+	if (!fp) {
+		return 0;
+	}
+	if (fscanf(fp, "%lf", &uptime) != 1) {
+		fclose(fp);
+		return 0;
+	}
+	fclose(fp);
+	if (uptime < 0) {
+		return 0;
+	}
+	{
+		double startsec = (double)startticks / (double)hz;
+		int age = (int)(uptime - startsec);
+
+		if (age < 0) {
+			return 0;
+		}
+		return age;
+	}
+}
+
+/*
+ * GPU Channel copyout must start at Channel attach (~2s) so
+ * occupancy 20 can handshake-drain. Waiting for gpu-alive-10s
+ * here delayed Bind/occupancy until 10s and dumped remain=7
+ * (code206). Network Ping still waits in kqchan until
+ * gpu-alive-10s. Do not wait for a cage.
+ */
+static int
+_dispatch_gpu_drain_hot_ready(mach_port_t port)
+{
+	static int cached = 0;
+	static int skip_log_n;
+	int age;
+	int has_main;
+	int has_child;
+	int has_viz;
+
+	(void)drain_hot_gpu_connected_v1;
+	if (cached) {
+		return 1;
+	}
+	if (!_dispatch_cmdline_is_gpu()) {
+		return 1;
+	}
+	age = _dispatch_gpu_age_sec();
+	has_main = _dispatch_self_has_comm("CrGpuMain");
+	has_child = _dispatch_self_has_comm("Chrome_ChildIOT") ||
+			_dispatch_self_has_comm("ChildThread") ||
+			_dispatch_self_has_comm("Chrome_IOThread");
+	has_viz = _dispatch_self_has_comm("VizCompositorTh");
+	(void)age;
+	(void)has_main;
+	cached = 1;
+	fprintf(stderr,
+		"dispatch MACHPORT drain_hot enable port=0x%x pid=%d age=%d CrGpuMain child=%d viz=%d gpu-alive-10s ChildThread connected drain_hot_gpu_connected_v1\n",
+		port, (int)getpid(), age, has_child, has_viz);
+	fflush(stderr);
+	return 1;
+}
+
 static void *
 _dispatch_machport_poll_thread(void *arg)
 {
@@ -1273,16 +1534,36 @@ _dispatch_machport_poll_thread(void *arg)
 	dispatch_queue_global_t gq = dispatch_get_global_queue(
 			DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
 
-	fprintf(stderr, "dispatch MACHPORT poll running port=0x%x\n", p->port);
+	fprintf(stderr, "dispatch MACHPORT poll running port=0x%x pid=%d drain_hot_v1\n",
+			p->port, (int)getpid());
 	fflush(stderr);
 	for (;;) {
 		mach_port_status_t status = { .mps_pset = 0 };
 		mach_msg_type_number_t cnt = MACH_PORT_RECEIVE_STATUS_COUNT;
 		kern_return_t kr;
 		struct pollfd pfd = { .fd = -1, .events = 0 };
-		(void)poll(&pfd, 0, 50);
+		unsigned msgcount;
+		unsigned last;
+		int stable_ms;
+		int idle_ms;
+
+		/*
+		 * Honest drain: when kmsgs are queued, do not sit on poll(50)
+		 * or a 200ms "stable" wait. That left ChildProcessHost Ping
+		 * (seq 4 / sublink 2) ~275ms behind msgid 34 so the decaying
+		 * Y→X LocalRouterLink dropped it (no copyin on 52/56).
+		 * Empty ports still wait; never merge EVFILT_MACHPORT on
+		 * mps_msgcount==0 (HandleRequest SIGTRAP).
+		 */
+		idle_ms = p->held ? 1 : 50;
+		if (_dispatch_cmdline_is_network() && !_dispatch_cmdline_is_gpu()) {
+			(void)dispatch_nested_timeout0_v1;
+			idle_ms = 0;
+		}
+		(void)poll(&pfd, 0, idle_ms);
 		if (!_dispatch_unote_registered(p->du)) {
-			fprintf(stderr, "dispatch MACHPORT poll exit port=0x%x\n", p->port);
+			fprintf(stderr, "dispatch MACHPORT poll exit port=0x%x pid=%d\n",
+					p->port, (int)getpid());
 			fflush(stderr);
 			return NULL;
 		}
@@ -1291,10 +1572,52 @@ _dispatch_machport_poll_thread(void *arg)
 		if (kr != KERN_SUCCESS || status.mps_msgcount == 0) {
 			continue;
 		}
+		if (!_dispatch_gpu_drain_hot_ready(p->port)) {
+			continue;
+		}
+
+		last = status.mps_msgcount;
+		stable_ms = 0;
+		if (!p->held && _dispatch_machport_holdoff_ok()) {
+			fprintf(stderr,
+					"dispatch MACHPORT invite-holdoff port=0x%x pid=%d msgcount=%u\n",
+					p->port, (int)getpid(), last);
+			fflush(stderr);
+			while (stable_ms < 5000) {
+				(void)poll(&pfd, 0, 50);
+				stable_ms += 50;
+				if (!_dispatch_unote_registered(p->du)) {
+					return NULL;
+				}
+				cnt = MACH_PORT_RECEIVE_STATUS_COUNT;
+				status.mps_pset = 0;
+				kr = mach_port_get_attributes(mach_task_self(), p->port,
+						MACH_PORT_RECEIVE_STATUS,
+						(mach_port_info_t)&status, &cnt);
+				if (kr != KERN_SUCCESS) {
+					break;
+				}
+				if (status.mps_msgcount != last) {
+					last = status.mps_msgcount;
+					stable_ms = 0;
+				}
+			}
+			p->held = 1;
+		} else {
+			p->held = 1;
+		}
+
+		cnt = MACH_PORT_RECEIVE_STATUS_COUNT;
+		status.mps_pset = 0;
+		kr = mach_port_get_attributes(mach_task_self(), p->port,
+				MACH_PORT_RECEIVE_STATUS, (mach_port_info_t)&status, &cnt);
+		if (kr != KERN_SUCCESS || status.mps_msgcount == 0) {
+			continue;
+		}
 		if (!os_atomic_cmpxchg(&p->inflight, 0, 1, relaxed)) {
 			continue;
 		}
-		unsigned msgcount = status.mps_msgcount;
+		msgcount = status.mps_msgcount;
 		dispatch_async((dispatch_queue_t)gq, ^{
 			unsigned n;
 			_dispatch_retain_unote_owner(p->du);
@@ -1306,13 +1629,28 @@ _dispatch_machport_poll_thread(void *arg)
 					DISPATCH_MACH_RECV_MESSAGE, 0);
 			n = ++p->fires;
 			os_atomic_store(&p->inflight, 0, relaxed);
-			if (n <= 8 || (n % 20) == 1) {
+			if (n <= 16 || (n % 20) == 1) {
 				fprintf(stderr,
-						"dispatch MACHPORT poll fire port=0x%x n=%u msgcount=%u\n",
-						p->port, n, msgcount);
+						"dispatch MACHPORT poll fire port=0x%x n=%u msgcount=%u pid=%d\n",
+						p->port, n, msgcount, (int)getpid());
 				fflush(stderr);
 			}
 		});
+		/* Wait for HandleRequest's timeout-0 receive to consume a kmsg. */
+		{
+			int w;
+			for (w = 0; w < 40; w++) {
+				(void)poll(&pfd, 0, 1);
+				cnt = MACH_PORT_RECEIVE_STATUS_COUNT;
+				status.mps_pset = 0;
+				kr = mach_port_get_attributes(mach_task_self(), p->port,
+						MACH_PORT_RECEIVE_STATUS,
+						(mach_port_info_t)&status, &cnt);
+				if (kr != KERN_SUCCESS || status.mps_msgcount < msgcount) {
+					break;
+				}
+			}
+		}
 	}
 }
 
@@ -1329,6 +1667,7 @@ _dispatch_machport_poll_arm(dispatch_unote_t du)
 	p->port = (mach_port_t)du._du->du_ident;
 	p->fires = 0;
 	p->inflight = 0;
+	p->held = 0;
 	fprintf(stderr, "dispatch MACHPORT poll arm port=0x%x ident=%llu filter=%d\n",
 			p->port, (unsigned long long)du._du->du_ident, (int)du._du->du_filter);
 	fflush(stderr);
